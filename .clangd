@@ -1,0 +1,15 @@
+CompileFlags:
+  Add:
+    - -std=gnu++20
+    - -xc++
+    - -Iinclude
+    - -nostdinc++
+    - --stdlib=libstdc++
+    - -isystem
+    - /opt/homebrew/Cellar/gcc/15.2.0/include/c++/15
+    - -isystem
+    - /opt/homebrew/Cellar/gcc/15.2.0/include/c++/15/aarch64-apple-darwin24
+    - -isystem
+    - /opt/homebrew/Cellar/gcc/15.2.0/include/c++/15/backward
+Index:
+  Background: Skip
