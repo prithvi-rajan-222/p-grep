@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -19,19 +20,45 @@
 
 namespace {
 
+namespace fs = std::filesystem;
+
 struct Options {
     std::string patterns_path;
-    std::string input_path;
+    fs::path search_path;
     std::string mode = "single";
     std::size_t jobs = std::max(1u, std::thread::hardware_concurrency());
     bool timing = false;
 };
 
-struct Chunk {
-    std::size_t scan_begin;
-    std::size_t scan_end;
-    std::size_t valid_begin;
-    std::size_t valid_end;
+struct SearchStats {
+    std::uint64_t files_scanned = 0;
+    std::uint64_t bytes_processed = 0;
+    std::uint64_t matched_lines = 0;
+
+    SearchStats& operator+=(const SearchStats& other) {
+        files_scanned += other.files_scanned;
+        bytes_processed += other.bytes_processed;
+        matched_lines += other.matched_lines;
+        return *this;
+    }
+};
+
+struct WorkerReport {
+    std::uint64_t worker_id = 0;
+    SearchStats stats;
+    double elapsed_ms = 0.0;
+};
+
+struct WorkUnit {
+    fs::path path;
+    std::uint64_t estimated_files = 0;
+    std::uint64_t estimated_bytes = 0;
+};
+
+struct SearchOutput {
+    SearchStats stats;
+    std::vector<std::string> lines;
+    std::vector<WorkerReport> workers;
 };
 
 [[noreturn]] void usage(std::string_view message = {}) {
@@ -39,9 +66,9 @@ struct Chunk {
         std::cerr << "error: " << message << "\n\n";
     }
     std::cerr
-        << "usage: p-grep --patterns FILE --input FILE [--mode single|threads|processes] [--jobs N] [--timing]\n"
+        << "usage: p-grep --patterns FILE --path FILE_OR_DIR [--mode single|threads|processes] [--jobs N] [--timing]\n"
         << "\n"
-        << "Counts fixed-string matches with Aho-Corasick. Patterns are read one per line.\n";
+        << "Searches fixed strings recursively and prints path:line:matching line.\n";
     std::exit(message.empty() ? 0 : 2);
 }
 
@@ -58,8 +85,8 @@ Options parse_args(int argc, char** argv) {
 
         if (arg == "--patterns" || arg == "-p") {
             options.patterns_path = require_value(arg);
-        } else if (arg == "--input" || arg == "-i") {
-            options.input_path = require_value(arg);
+        } else if (arg == "--path" || arg == "--input" || arg == "-i") {
+            options.search_path = require_value(arg);
         } else if (arg == "--mode" || arg == "-m") {
             options.mode = require_value(arg);
         } else if (arg == "--jobs" || arg == "-j") {
@@ -76,8 +103,8 @@ Options parse_args(int argc, char** argv) {
     if (options.patterns_path.empty()) {
         usage("--patterns is required");
     }
-    if (options.input_path.empty()) {
-        usage("--input is required");
+    if (options.search_path.empty()) {
+        usage("--path is required");
     }
     if (options.mode != "single" && options.mode != "threads" && options.mode != "processes") {
         usage("--mode must be single, threads, or processes");
@@ -87,22 +114,6 @@ Options parse_args(int argc, char** argv) {
     }
 
     return options;
-}
-
-std::string read_file(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        throw std::runtime_error("failed to open " + path);
-    }
-    in.seekg(0, std::ios::end);
-    const std::streamoff size = in.tellg();
-    in.seekg(0, std::ios::beg);
-    std::string data(static_cast<std::size_t>(std::max<std::streamoff>(0, size)), '\0');
-    in.read(data.data(), static_cast<std::streamsize>(data.size()));
-    if (!in && !in.eof()) {
-        throw std::runtime_error("failed to read " + path);
-    }
-    return data;
 }
 
 AhoCorasick load_matcher(const std::string& path) {
@@ -128,38 +139,318 @@ AhoCorasick load_matcher(const std::string& path) {
     return ac;
 }
 
-std::vector<Chunk> make_chunks(std::size_t text_size, std::size_t jobs, std::size_t overlap) {
-    jobs = std::min(jobs, std::max<std::size_t>(1, text_size));
-    std::vector<Chunk> chunks;
-    chunks.reserve(jobs);
+bool is_hidden_name(const fs::path& path) {
+    const std::string name = path.filename().string();
+    return !name.empty() && name[0] == '.';
+}
 
-    for (std::size_t job = 0; job < jobs; ++job) {
-        const std::size_t valid_begin = text_size * job / jobs;
-        const std::size_t valid_end = text_size * (job + 1) / jobs;
-        const std::size_t scan_begin = valid_begin > overlap ? valid_begin - overlap : 0;
-        const std::size_t scan_end = std::min(text_size, valid_end + overlap);
-        chunks.push_back(Chunk{scan_begin, scan_end, valid_begin - scan_begin, valid_end - scan_begin});
+bool is_basic_ignored_directory(const fs::path& path) {
+    const std::string name = path.filename().string();
+    return name == ".git"
+        || name == "build"
+        || name == "node_modules"
+        || name == "target"
+        || name == "dist"
+        || name.rfind("cmake-build-", 0) == 0;
+}
+
+bool is_probably_binary(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return true;
     }
 
-    return chunks;
+    constexpr std::size_t kProbeSize = 8192;
+    char buffer[kProbeSize];
+    in.read(buffer, static_cast<std::streamsize>(kProbeSize));
+    const std::streamsize n = in.gcount();
+
+    for (std::streamsize i = 0; i < n; ++i) {
+        if (buffer[i] == '\0') {
+            return true;
+        }
+    }
+    return false;
 }
 
-std::uint64_t count_single(const AhoCorasick& ac, std::string_view text) {
-    return ac.count_matches(text);
+bool should_search_file(const fs::directory_entry& entry) {
+    std::error_code ec;
+    if (entry.is_symlink(ec) || !entry.is_regular_file(ec)) {
+        return false;
+    }
+    if (is_hidden_name(entry.path())) {
+        return false;
+    }
+    return !is_probably_binary(entry.path());
 }
 
-std::uint64_t count_threads(const AhoCorasick& ac, std::string_view text, std::size_t jobs) {
-    const std::size_t overlap = ac.max_pattern_length() > 0 ? ac.max_pattern_length() - 1 : 0;
-    const auto chunks = make_chunks(text.size(), jobs, overlap);
+bool should_descend_directory(const fs::directory_entry& entry) {
+    std::error_code ec;
+    return entry.is_directory(ec)
+        && !entry.is_symlink(ec)
+        && !is_hidden_name(entry.path())
+        && !is_basic_ignored_directory(entry.path());
+}
+
+std::uint64_t searchable_file_size(const fs::directory_entry& entry) {
+    std::error_code ec;
+    if (entry.is_symlink(ec) || !entry.is_regular_file(ec) || is_hidden_name(entry.path())) {
+        return 0;
+    }
+
+    const std::uint64_t size = entry.file_size(ec);
+    return ec ? 0 : size;
+}
+
+SearchStats estimate_searchable_stats(const fs::path& root) {
+    std::error_code ec;
+    const fs::directory_entry root_entry(root, ec);
+    if (ec) {
+        return {};
+    }
+
+    if (root_entry.is_regular_file(ec)) {
+        const std::uint64_t bytes = searchable_file_size(root_entry);
+        return bytes == 0 ? SearchStats{} : SearchStats{1, bytes, 0};
+    }
+    if (!should_descend_directory(root_entry)) {
+        return {};
+    }
+
+    SearchStats total;
+    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+    const fs::recursive_directory_iterator end;
+    while (!ec && it != end) {
+        const fs::directory_entry entry = *it;
+        if (entry.is_symlink(ec)) {
+            if (entry.is_directory(ec)) {
+                it.disable_recursion_pending();
+            }
+        } else if (entry.is_directory(ec)) {
+            if (!should_descend_directory(entry)) {
+                it.disable_recursion_pending();
+            }
+        } else {
+            const std::uint64_t bytes = searchable_file_size(entry);
+            if (bytes > 0) {
+                ++total.files_scanned;
+                total.bytes_processed += bytes;
+            }
+        }
+
+        it.increment(ec);
+    }
+    return total;
+}
+
+std::string format_match_line(const fs::path& path, std::uint64_t line_number, std::string_view line) {
+    std::string result = path.string();
+    result.push_back(':');
+    result += std::to_string(line_number);
+    result.push_back(':');
+    result.append(line);
+    return result;
+}
+
+void search_file(const AhoCorasick& ac, const fs::path& path, SearchOutput& output) {
+    if (is_probably_binary(path)) {
+        return;
+    }
+
+    std::error_code ec;
+    const std::uint64_t file_size = fs::file_size(path, ec);
+
+    std::ifstream in(path);
+    if (!in) {
+        return;
+    }
+
+    ++output.stats.files_scanned;
+    if (!ec) {
+        output.stats.bytes_processed += file_size;
+    }
+    std::string line;
+    std::uint64_t line_number = 0;
+    while (std::getline(in, line)) {
+        ++line_number;
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (ac.contains_match(line)) {
+            ++output.stats.matched_lines;
+            output.lines.push_back(format_match_line(path, line_number, line));
+        }
+    }
+}
+
+void search_path(const AhoCorasick& ac, const fs::path& root, SearchOutput& output) {
+    std::error_code ec;
+    const fs::directory_entry root_entry(root, ec);
+    if (ec) {
+        return;
+    }
+
+    if (root_entry.is_symlink(ec)) {
+        return;
+    }
+    if (root_entry.is_regular_file(ec)) {
+        if (!is_hidden_name(root) && !is_probably_binary(root)) {
+            search_file(ac, root, output);
+        }
+        return;
+    }
+    if (!root_entry.is_directory(ec)) {
+        return;
+    }
+
+    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+    const fs::recursive_directory_iterator end;
+    while (!ec && it != end) {
+        const fs::directory_entry entry = *it;
+        const fs::path path = entry.path();
+
+        if (entry.is_symlink(ec)) {
+            if (entry.is_directory(ec)) {
+                it.disable_recursion_pending();
+            }
+        } else if (entry.is_directory(ec)) {
+            if (is_hidden_name(path) || is_basic_ignored_directory(path)) {
+                it.disable_recursion_pending();
+            }
+        } else if (should_search_file(entry)) {
+            search_file(ac, path, output);
+        }
+
+        it.increment(ec);
+    }
+}
+
+std::uint64_t estimated_work_cost(const WorkUnit& unit);
+
+void add_work_unit(std::vector<WorkUnit>& units, const fs::path& path) {
+    const SearchStats estimate = estimate_searchable_stats(path);
+    if (estimate.files_scanned > 0 || estimate.bytes_processed > 0) {
+        units.push_back(WorkUnit{path, estimate.files_scanned, estimate.bytes_processed});
+    }
+}
+
+std::vector<WorkUnit> make_work_units(const fs::path& root) {
+    std::error_code ec;
+    const fs::directory_entry root_entry(root, ec);
+    if (ec) {
+        throw std::runtime_error("failed to inspect " + root.string());
+    }
+
+    if (!root_entry.is_directory(ec)) {
+        const SearchStats estimate = estimate_searchable_stats(root);
+        return {WorkUnit{root, estimate.files_scanned, estimate.bytes_processed}};
+    }
+
+    std::vector<WorkUnit> units;
+    fs::directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+    const fs::directory_iterator end;
+    while (!ec && it != end) {
+        const fs::directory_entry entry = *it;
+        const fs::path path = entry.path();
+
+        if (entry.is_symlink(ec)) {
+            it.increment(ec);
+            continue;
+        }
+        if (entry.is_directory(ec) && !should_descend_directory(entry)) {
+            it.increment(ec);
+            continue;
+        }
+
+        if (entry.is_directory(ec)) {
+            std::error_code child_ec;
+            fs::directory_iterator child_it(path, fs::directory_options::skip_permission_denied, child_ec);
+            const fs::directory_iterator child_end;
+            bool added_child = false;
+            while (!child_ec && child_it != child_end) {
+                const fs::directory_entry child = *child_it;
+                if (!child.is_symlink(child_ec)
+                    && ((child.is_directory(child_ec) && should_descend_directory(child))
+                        || child.is_regular_file(child_ec))) {
+                    add_work_unit(units, child.path());
+                    added_child = true;
+                }
+                child_it.increment(child_ec);
+            }
+            if (!added_child) {
+                add_work_unit(units, path);
+            }
+        } else if (entry.is_regular_file(ec)) {
+            add_work_unit(units, path);
+        }
+
+        it.increment(ec);
+    }
+
+    std::sort(units.begin(), units.end(), [](const WorkUnit& a, const WorkUnit& b) {
+        const std::uint64_t a_cost = estimated_work_cost(a);
+        const std::uint64_t b_cost = estimated_work_cost(b);
+        if (a_cost != b_cost) {
+            return a_cost > b_cost;
+        }
+        return a.path < b.path;
+    });
+    if (units.empty()) {
+        const SearchStats estimate = estimate_searchable_stats(root);
+        units.push_back(WorkUnit{root, estimate.files_scanned, estimate.bytes_processed});
+    }
+    return units;
+}
+
+std::uint64_t estimated_work_cost(const WorkUnit& unit) {
+    constexpr std::uint64_t kPerFileCostBytes = 32768;
+    return unit.estimated_bytes + unit.estimated_files * kPerFileCostBytes;
+}
+
+std::vector<std::vector<fs::path>> assign_work_units(const std::vector<WorkUnit>& units, std::size_t jobs) {
+    jobs = std::max<std::size_t>(1, jobs);
+    std::vector<std::vector<fs::path>> assignments(jobs);
+    std::vector<std::uint64_t> assigned_cost(jobs, 0);
+
+    for (const WorkUnit& unit : units) {
+        const auto lightest = std::min_element(assigned_cost.begin(), assigned_cost.end());
+        const std::size_t worker = static_cast<std::size_t>(lightest - assigned_cost.begin());
+        assignments[worker].push_back(unit.path);
+        assigned_cost[worker] += estimated_work_cost(unit);
+    }
+
+    return assignments;
+}
+
+SearchOutput search_single(const AhoCorasick& ac, const fs::path& root) {
+    SearchOutput output;
+    search_path(ac, root, output);
+    return output;
+}
+
+SearchOutput search_assigned_roots(const AhoCorasick& ac, const std::vector<fs::path>& roots) {
+    SearchOutput output;
+    for (const fs::path& root : roots) {
+        search_path(ac, root, output);
+    }
+    return output;
+}
+
+SearchOutput search_threads(const AhoCorasick& ac, const fs::path& root, std::size_t jobs) {
+    const auto assignments = assign_work_units(make_work_units(root), jobs);
     std::vector<std::thread> threads;
-    std::vector<std::uint64_t> counts(chunks.size(), 0);
-    threads.reserve(chunks.size());
+    std::vector<SearchOutput> outputs(assignments.size());
+    std::vector<WorkerReport> reports(assignments.size());
+    threads.reserve(assignments.size());
 
-    for (std::size_t i = 0; i < chunks.size(); ++i) {
+    for (std::size_t i = 0; i < assignments.size(); ++i) {
         threads.emplace_back([&, i] {
-            const Chunk& chunk = chunks[i];
-            const std::string_view view(text.data() + chunk.scan_begin, chunk.scan_end - chunk.scan_begin);
-            counts[i] = ac.count_matches_in_range(view, chunk.valid_begin, chunk.valid_end);
+            const auto start = std::chrono::steady_clock::now();
+            outputs[i] = search_assigned_roots(ac, assignments[i]);
+            const auto end = std::chrono::steady_clock::now();
+            reports[i].worker_id = i;
+            reports[i].stats = outputs[i].stats;
+            reports[i].elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
         });
     }
 
@@ -167,71 +458,117 @@ std::uint64_t count_threads(const AhoCorasick& ac, std::string_view text, std::s
         thread.join();
     }
 
-    std::uint64_t total = 0;
-    for (std::uint64_t count : counts) {
-        total += count;
+    SearchOutput combined;
+    combined.workers = std::move(reports);
+    for (SearchOutput& output : outputs) {
+        combined.stats += output.stats;
+        combined.lines.insert(
+            combined.lines.end(),
+            std::make_move_iterator(output.lines.begin()),
+            std::make_move_iterator(output.lines.end()));
     }
-    return total;
+    return combined;
 }
 
-std::uint64_t count_processes(const AhoCorasick& ac, std::string_view text, std::size_t jobs) {
+void write_all(int fd, const void* data, std::size_t size) {
 #if defined(__unix__) || defined(__APPLE__)
-    const std::size_t overlap = ac.max_pattern_length() > 0 ? ac.max_pattern_length() - 1 : 0;
-    const auto chunks = make_chunks(text.size(), jobs, overlap);
+    const auto* bytes = static_cast<const char*>(data);
+    std::size_t written = 0;
+    while (written < size) {
+        const ssize_t n = write(fd, bytes + written, size - written);
+        if (n <= 0) {
+            throw std::runtime_error(std::string("write failed: ") + std::strerror(errno));
+        }
+        written += static_cast<std::size_t>(n);
+    }
+#else
+    (void)fd;
+    (void)data;
+    (void)size;
+#endif
+}
+
+void read_all(int fd, void* data, std::size_t size) {
+#if defined(__unix__) || defined(__APPLE__)
+    auto* bytes = static_cast<char*>(data);
+    std::size_t read_total = 0;
+    while (read_total < size) {
+        const ssize_t n = read(fd, bytes + read_total, size - read_total);
+        if (n <= 0) {
+            throw std::runtime_error("failed to read child result");
+        }
+        read_total += static_cast<std::size_t>(n);
+    }
+#else
+    (void)fd;
+    (void)data;
+    (void)size;
+#endif
+}
+
+SearchOutput search_processes(const AhoCorasick& ac, const fs::path& root, std::size_t jobs) {
+#if defined(__unix__) || defined(__APPLE__)
+    const auto assignments = assign_work_units(make_work_units(root), jobs);
     std::vector<pid_t> children;
     std::vector<int> read_fds;
-    children.reserve(chunks.size());
-    read_fds.reserve(chunks.size());
+    std::vector<fs::path> output_paths;
+    children.reserve(assignments.size());
+    read_fds.reserve(assignments.size());
+    output_paths.reserve(assignments.size());
 
-    for (const Chunk& chunk : chunks) {
+    const fs::path tmp_dir = fs::temp_directory_path();
+    const auto parent_pid = static_cast<long long>(getpid());
+
+    for (std::size_t i = 0; i < assignments.size(); ++i) {
         int fds[2];
         if (pipe(fds) != 0) {
             throw std::runtime_error(std::string("pipe failed: ") + std::strerror(errno));
         }
 
+        fs::path child_output = tmp_dir / ("p-grep-" + std::to_string(parent_pid) + "-" + std::to_string(i) + ".out");
         const pid_t pid = fork();
         if (pid < 0) {
             throw std::runtime_error(std::string("fork failed: ") + std::strerror(errno));
         }
         if (pid == 0) {
             close(fds[0]);
-            const std::string_view view(text.data() + chunk.scan_begin, chunk.scan_end - chunk.scan_begin);
-            const std::uint64_t count = ac.count_matches_in_range(view, chunk.valid_begin, chunk.valid_end);
-            const auto* bytes = reinterpret_cast<const char*>(&count);
-            std::size_t written = 0;
-            while (written < sizeof(count)) {
-                const ssize_t n = write(fds[1], bytes + written, sizeof(count) - written);
-                if (n <= 0) {
+            try {
+                const auto start = std::chrono::steady_clock::now();
+                SearchOutput output = search_assigned_roots(ac, assignments[i]);
+                const auto end = std::chrono::steady_clock::now();
+                std::ofstream out(child_output);
+                if (!out) {
                     _exit(1);
                 }
-                written += static_cast<std::size_t>(n);
+                for (const std::string& line : output.lines) {
+                    out << line << '\n';
+                }
+                out.close();
+                WorkerReport report;
+                report.worker_id = i;
+                report.stats = output.stats;
+                report.elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                write_all(fds[1], &report, sizeof(report));
+                close(fds[1]);
+                _exit(0);
+            } catch (...) {
+                _exit(1);
             }
-            close(fds[1]);
-            _exit(0);
         }
 
         close(fds[1]);
         children.push_back(pid);
         read_fds.push_back(fds[0]);
+        output_paths.push_back(std::move(child_output));
     }
 
-    std::uint64_t total = 0;
+    SearchOutput combined;
     for (int fd : read_fds) {
-        std::uint64_t count = 0;
-        auto* bytes = reinterpret_cast<char*>(&count);
-        std::size_t read_total = 0;
-        while (read_total < sizeof(count)) {
-            const ssize_t n = read(fd, bytes + read_total, sizeof(count) - read_total);
-            if (n <= 0) {
-                break;
-            }
-            read_total += static_cast<std::size_t>(n);
-        }
+        WorkerReport report;
+        read_all(fd, &report, sizeof(report));
         close(fd);
-        if (read_total != sizeof(count)) {
-            throw std::runtime_error("failed to read child result");
-        }
-        total += count;
+        combined.stats += report.stats;
+        combined.workers.push_back(report);
     }
 
     for (pid_t child : children) {
@@ -241,13 +578,41 @@ std::uint64_t count_processes(const AhoCorasick& ac, std::string_view text, std:
         }
     }
 
-    return total;
+    for (const fs::path& output_path : output_paths) {
+        std::ifstream in(output_path);
+        std::string line;
+        while (std::getline(in, line)) {
+            combined.lines.push_back(line);
+        }
+        std::error_code ec;
+        fs::remove(output_path, ec);
+    }
+
+    return combined;
 #else
     (void)ac;
-    (void)text;
+    (void)root;
     (void)jobs;
     throw std::runtime_error("--mode processes requires a POSIX platform");
 #endif
+}
+
+void print_output(const SearchOutput& output) {
+    for (const std::string& line : output.lines) {
+        std::cout << line << '\n';
+    }
+}
+
+void print_worker_reports(std::string_view mode, const std::vector<WorkerReport>& workers) {
+    for (const WorkerReport& worker : workers) {
+        std::cerr << mode
+                  << "_worker=" << worker.worker_id
+                  << " files=" << worker.stats.files_scanned
+                  << " bytes=" << worker.stats.bytes_processed
+                  << " matched_lines=" << worker.stats.matched_lines
+                  << " elapsed_ms=" << worker.elapsed_ms
+                  << "\n";
+    }
 }
 
 } // namespace
@@ -260,31 +625,32 @@ int main(int argc, char** argv) {
         AhoCorasick ac = load_matcher(options.patterns_path);
         const auto build_end = std::chrono::steady_clock::now();
 
-        const std::string text = read_file(options.input_path);
         const auto search_start = std::chrono::steady_clock::now();
-
-        std::uint64_t count = 0;
+        SearchOutput output;
         if (options.mode == "single") {
-            count = count_single(ac, text);
+            output = search_single(ac, options.search_path);
         } else if (options.mode == "threads") {
-            count = count_threads(ac, text, options.jobs);
+            output = search_threads(ac, options.search_path, options.jobs);
         } else {
-            count = count_processes(ac, text, options.jobs);
+            output = search_processes(ac, options.search_path, options.jobs);
         }
-
         const auto search_end = std::chrono::steady_clock::now();
-        std::cout << count << "\n";
+
+        print_output(output);
 
         if (options.timing) {
             const auto build_ms = std::chrono::duration<double, std::milli>(build_end - build_start).count();
             const auto search_ms = std::chrono::duration<double, std::milli>(search_end - search_start).count();
             std::cerr << "patterns=" << ac.pattern_count()
-                      << " bytes=" << text.size()
+                      << " files=" << output.stats.files_scanned
+                      << " bytes=" << output.stats.bytes_processed
+                      << " matched_lines=" << output.stats.matched_lines
                       << " mode=" << options.mode
                       << " jobs=" << options.jobs
                       << " build_ms=" << build_ms
                       << " search_ms=" << search_ms
                       << "\n";
+            print_worker_reports(options.mode, output.workers);
         }
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";

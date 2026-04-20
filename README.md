@@ -1,14 +1,13 @@
 # p-grep
 
-`p-grep` is a small C++ Aho-Corasick playground for fixed-string multi-pattern search. It starts with the classic trie plus suffix-link construction described by cp-algorithms, then measures:
+`p-grep` is a small C++ Aho-Corasick playground for fixed-string multi-pattern code search. It starts with the classic trie plus suffix-link construction described by cp-algorithms, then searches files in a ripgrep-like `path:line:line text` format.
 
-- a single-threaded scan
-- a shared-memory multi-threaded scan
-- a POSIX multi-process scan
-- system `grep`
-- `ripgrep`
+It currently supports:
 
-The project reports total matches, not matching lines.
+- single-threaded recursive path search
+- shared-memory multi-threaded recursive path search
+- POSIX multi-process recursive path search
+- benchmark comparison with system `grep` and `ripgrep`
 
 ## Build
 
@@ -16,23 +15,32 @@ The project reports total matches, not matching lines.
 make
 ```
 
-## Generate Data
+## Patterns
 
-```sh
-bin/generate-corpus --bytes 8388608 --patterns 256 --pattern-length 8
+The default real-code-search pattern set lives at:
+
+```text
+patterns/code-search.txt
 ```
-
-This writes:
-
-- `data/patterns.txt`
-- `data/corpus.txt`
 
 ## Run
 
 ```sh
-bin/p-grep --patterns data/patterns.txt --input data/corpus.txt --mode single --timing
-bin/p-grep --patterns data/patterns.txt --input data/corpus.txt --mode threads --jobs 8 --timing
-bin/p-grep --patterns data/patterns.txt --input data/corpus.txt --mode processes --jobs 8 --timing
+bin/p-grep --patterns patterns/code-search.txt --path /path/to/codebase --mode single --timing
+bin/p-grep --patterns patterns/code-search.txt --path /path/to/codebase --mode threads --jobs 8 --timing
+bin/p-grep --patterns patterns/code-search.txt --path /path/to/codebase --mode processes --jobs 8 --timing
+```
+
+Output looks like:
+
+```text
+src/main.cpp:42:    // TODO: handle this case
+```
+
+With `--timing`, summary and worker timing are printed to stderr. Thread/process modes include one line per requested worker:
+
+```text
+threads_worker=0 files=10 bytes=123456 matched_lines=42 elapsed_ms=3.21
 ```
 
 ## Benchmark
@@ -44,13 +52,15 @@ make bench
 Or with custom settings:
 
 ```sh
-python3 scripts/bench.py --bytes 134217728 --patterns 1024 --pattern-length 12 --jobs 8 --repeats 7 --regenerate
+python3 scripts/bench.py --path /path/to/codebase --patterns patterns/code-search.txt --jobs 8 --repeats 3
 ```
 
-`grep` and `ripgrep` are run as fixed-string matchers using `-F -o -f`. Their `-o` mode counts non-overlapping printed matches, while `p-grep` counts every pattern ending, including overlapping matches. The generated corpus uses random fixed-length tokens, which keeps those counts practically comparable.
+`ripgrep` is run as a fixed-string line matcher using `rg -F -n -f`. `grep` is run with `grep -R -F -n -f`.
 
 ## Notes
 
-The threaded and process modes split the input into chunks. Each chunk scans up to `max_pattern_length - 1` bytes of left and right overlap and only counts matches whose start position belongs to that chunk, so matches crossing a split are not lost or double-counted.
+The threaded and process modes do not split individual files. They expand directory work one level below the search root, estimate each unit by bytes plus file count, then greedily assign the largest units to the currently lightest worker.
+
+The recursive search follows the basic visible ripgrep defaults: hidden files/directories are skipped, symlinks are not followed, binary files are skipped when a NUL byte is found in the first 8 KiB, and common generated directories such as `.git`, `build`, `cmake-build-*`, `node_modules`, `target`, and `dist` are skipped. Full `.gitignore`/`.ignore`/`.rgignore` parsing is not implemented yet.
 
 This project defaults to `/opt/homebrew/bin/g++-15` when it is installed, matching the compiler setup in `~/Desktop/Coding/cc`. You can override it with `make CXX=/path/to/compiler`.

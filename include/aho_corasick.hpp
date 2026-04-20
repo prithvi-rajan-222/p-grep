@@ -88,6 +88,19 @@ public:
         return count;
     }
 
+    [[nodiscard]] bool contains_match(std::string_view text) const {
+        std::uint32_t state = 0;
+
+        for (unsigned char ch : text) {
+            state = trie_[state].next[ch];
+            if (!trie_[state].out.empty()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     [[nodiscard]] std::uint64_t count_matches_in_range(
         std::string_view text,
         std::size_t valid_begin,
@@ -99,8 +112,11 @@ public:
             state = trie_[state].next[static_cast<unsigned char>(text[i])];
             for (std::uint32_t pattern_id : trie_[state].out) {
                 const std::size_t len = pattern_lengths_[pattern_id];
+                if (i + 1 < len) {
+                    continue;
+                }
                 const std::size_t start = i + 1 - len;
-                if (i + 1 >= len && start >= valid_begin && start < valid_end) {
+                if (start >= valid_begin && start < valid_end) {
                     ++count;
                 }
             }
