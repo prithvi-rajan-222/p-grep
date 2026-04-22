@@ -1,6 +1,7 @@
 #include "aho_corasick.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -184,12 +185,7 @@ bool is_basic_ignored_directory(const fs::path& path) {
         || name.rfind("cmake-build-", 0) == 0;
 }
 
-bool is_probably_binary(const fs::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        return true;
-    }
-
+bool stream_starts_binary(std::ifstream& in) {
     constexpr std::size_t kProbeSize = 8192;
     char buffer[kProbeSize];
     in.read(buffer, static_cast<std::streamsize>(kProbeSize));
@@ -200,6 +196,9 @@ bool is_probably_binary(const fs::path& path) {
             return true;
         }
     }
+
+    in.clear();
+    in.seekg(0, std::ios::beg);
     return false;
 }
 
@@ -276,12 +275,11 @@ std::vector<FileTask> collect_file_tasks(const fs::path& root) {
 }
 
 void search_file_task(const AhoCorasick& ac, const FileTask& file, SearchOutput& output) {
-    if (is_probably_binary(file.path)) {
+    std::ifstream in(file.path, std::ios::binary);
+    if (!in) {
         return;
     }
-
-    std::ifstream in(file.path);
-    if (!in) {
+    if (stream_starts_binary(in)) {
         return;
     }
 
@@ -353,26 +351,42 @@ SearchOutput search_assigned_files(const AhoCorasick& ac, const std::vector<File
     return output;
 }
 
+SearchOutput search_dynamic_files(
+    const AhoCorasick& ac,
+    const std::vector<FileTask>& files,
+    std::atomic<std::size_t>& next_file) {
+    SearchOutput output;
+    while (true) {
+        const std::size_t index = next_file.fetch_add(1, std::memory_order_relaxed);
+        if (index >= files.size()) {
+            break;
+        }
+        search_file_task(ac, files[index], output);
+    }
+    return output;
+}
+
 SearchOutput search_threads(const AhoCorasick& ac, const fs::path& root, std::size_t jobs) {
     SearchOutput combined;
 
     const auto plan_start = std::chrono::steady_clock::now();
     const auto files = collect_file_tasks(root);
-    const auto assignments = assign_file_tasks(files, jobs);
     const auto plan_end = std::chrono::steady_clock::now();
     combined.phases.work_units = files.size();
     combined.phases.work_plan_ms = elapsed_ms(plan_start, plan_end);
 
+    jobs = std::max<std::size_t>(1, jobs);
     std::vector<std::thread> threads;
-    std::vector<SearchOutput> outputs(assignments.size());
-    std::vector<WorkerReport> reports(assignments.size());
-    threads.reserve(assignments.size());
+    std::vector<SearchOutput> outputs(jobs);
+    std::vector<WorkerReport> reports(jobs);
+    std::atomic<std::size_t> next_file{0};
+    threads.reserve(jobs);
 
     const auto spawn_start = std::chrono::steady_clock::now();
-    for (std::size_t i = 0; i < assignments.size(); ++i) {
+    for (std::size_t i = 0; i < jobs; ++i) {
         threads.emplace_back([&, i] {
             const auto start = std::chrono::steady_clock::now();
-            outputs[i] = search_assigned_files(ac, assignments[i]);
+            outputs[i] = search_dynamic_files(ac, files, next_file);
             const auto end = std::chrono::steady_clock::now();
             reports[i].worker_id = i;
             reports[i].stats = outputs[i].stats;
