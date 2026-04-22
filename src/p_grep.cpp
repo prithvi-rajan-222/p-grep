@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -28,6 +29,7 @@ namespace fs = std::filesystem;
 struct Options {
     std::string patterns_path;
     fs::path search_path;
+    fs::path output_path;
     std::string mode = "single";
     std::size_t jobs = std::max(1u, std::thread::hardware_concurrency());
     bool timing = false;
@@ -85,7 +87,7 @@ struct MatcherLoadResult {
         std::cerr << "error: " << message << "\n\n";
     }
     std::cerr
-        << "usage: p-grep --patterns FILE --path FILE_OR_DIR [--mode single|threads|processes] [--jobs N] [--timing]\n"
+        << "usage: p-grep --patterns FILE --path FILE_OR_DIR [--mode single|threads|processes] [--jobs N] [--output FILE] [--timing]\n"
         << "\n"
         << "Counts matching lines recursively.\n";
     std::exit(message.empty() ? 0 : 2);
@@ -106,6 +108,8 @@ Options parse_args(int argc, char** argv) {
             options.patterns_path = require_value(arg);
         } else if (arg == "--path" || arg == "--input" || arg == "-i") {
             options.search_path = require_value(arg);
+        } else if (arg == "--output" || arg == "-o") {
+            options.output_path = require_value(arg);
         } else if (arg == "--mode" || arg == "-m") {
             options.mode = require_value(arg);
         } else if (arg == "--jobs" || arg == "-j") {
@@ -133,6 +137,17 @@ Options parse_args(int argc, char** argv) {
     }
 
     return options;
+}
+
+void prepare_output_file(const fs::path& path) {
+    if (path.empty()) {
+        return;
+    }
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("failed to open output file " + path.string());
+    }
 }
 
 template <typename Start, typename End>
@@ -269,6 +284,8 @@ void search_file_task(
     const AhoCorasick& ac,
     const FileTask& file,
     std::vector<char>& buffer,
+    std::ostream* match_output,
+    std::mutex* output_mutex,
     SearchOutput& output) {
     std::ifstream in(file.path, std::ios::binary);
     if (!in) {
@@ -280,6 +297,23 @@ void search_file_task(
     bool saw_byte_on_line = false;
     bool saw_content = false;
     std::uint64_t matched_lines = 0;
+    std::uint64_t line_number = 1;
+    const bool emit_matches = match_output != nullptr;
+    const std::string path_text = emit_matches ? file.path.string() : std::string();
+    std::string current_line;
+
+    auto emit_current_line = [&] {
+        ++matched_lines;
+        if (!emit_matches) {
+            return;
+        }
+        if (output_mutex != nullptr) {
+            std::lock_guard<std::mutex> lock(*output_mutex);
+            (*match_output) << path_text << ':' << line_number << ':' << current_line << '\n';
+        } else {
+            (*match_output) << path_text << ':' << line_number << ':' << current_line << '\n';
+        }
+    };
 
     while (in) {
         in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
@@ -292,6 +326,9 @@ void search_file_task(
             saw_content = true;
             if (ch != '\n' && ch != '\r') {
                 saw_byte_on_line = true;
+                if (emit_matches) {
+                    current_line.push_back(static_cast<char>(ch));
+                }
             }
             state = ac.step(state, ch);
             if (ac.is_match_state(state)) {
@@ -299,10 +336,14 @@ void search_file_task(
             }
             if (ch == '\n') {
                 if (line_matched) {
-                    ++matched_lines;
+                    emit_current_line();
                 }
                 line_matched = false;
                 saw_byte_on_line = false;
+                if (emit_matches) {
+                    current_line.clear();
+                }
+                ++line_number;
                 state = ac.start_state();
             }
         }
@@ -315,7 +356,7 @@ void search_file_task(
     ++output.stats.files_scanned;
     output.stats.bytes_processed += file.size;
     if (line_matched && saw_byte_on_line) {
-        ++matched_lines;
+        emit_current_line();
     }
     output.stats.matched_lines += matched_lines;
 }
@@ -349,7 +390,7 @@ std::vector<std::vector<FileTask>> assign_file_tasks(std::vector<FileTask> files
     return assignments;
 }
 
-SearchOutput search_single(const AhoCorasick& ac, const fs::path& root) {
+SearchOutput search_single(const AhoCorasick& ac, const fs::path& root, const fs::path& output_path) {
     SearchOutput output;
     const auto plan_start = std::chrono::steady_clock::now();
     const auto files = collect_file_tasks(root);
@@ -359,8 +400,15 @@ SearchOutput search_single(const AhoCorasick& ac, const fs::path& root) {
 
     const auto start = std::chrono::steady_clock::now();
     std::vector<char> buffer(256 * 1024);
+    std::ofstream match_output;
+    if (!output_path.empty()) {
+        match_output.open(output_path, std::ios::binary | std::ios::app);
+        if (!match_output) {
+            throw std::runtime_error("failed to open output file " + output_path.string());
+        }
+    }
     for (const FileTask& file : files) {
-        search_file_task(ac, file, buffer, output);
+        search_file_task(ac, file, buffer, match_output.is_open() ? &match_output : nullptr, nullptr, output);
     }
     const auto end = std::chrono::steady_clock::now();
     output.phases.worker_wait_ms = elapsed_ms(start, end);
@@ -368,11 +416,21 @@ SearchOutput search_single(const AhoCorasick& ac, const fs::path& root) {
     return output;
 }
 
-SearchOutput search_assigned_files(const AhoCorasick& ac, const std::vector<FileTask>& files) {
+SearchOutput search_assigned_files(
+    const AhoCorasick& ac,
+    const std::vector<FileTask>& files,
+    const fs::path& output_path) {
     SearchOutput output;
     std::vector<char> buffer(256 * 1024);
+    std::ofstream match_output;
+    if (!output_path.empty()) {
+        match_output.open(output_path, std::ios::binary | std::ios::app);
+        if (!match_output) {
+            throw std::runtime_error("failed to open output file " + output_path.string());
+        }
+    }
     for (const FileTask& file : files) {
-        search_file_task(ac, file, buffer, output);
+        search_file_task(ac, file, buffer, match_output.is_open() ? &match_output : nullptr, nullptr, output);
     }
     return output;
 }
@@ -380,7 +438,9 @@ SearchOutput search_assigned_files(const AhoCorasick& ac, const std::vector<File
 SearchOutput search_dynamic_files(
     const AhoCorasick& ac,
     const std::vector<FileTask>& files,
-    std::atomic<std::size_t>& next_file) {
+    std::atomic<std::size_t>& next_file,
+    std::ostream* match_output,
+    std::mutex* output_mutex) {
     SearchOutput output;
     std::vector<char> buffer(256 * 1024);
     constexpr std::size_t kBatchSize = 5;
@@ -391,13 +451,13 @@ SearchOutput search_dynamic_files(
         }
         const std::size_t end = std::min(begin + kBatchSize, files.size());
         for (std::size_t index = begin; index < end; ++index) {
-            search_file_task(ac, files[index], buffer, output);
+            search_file_task(ac, files[index], buffer, match_output, output_mutex, output);
         }
     }
     return output;
 }
 
-SearchOutput search_threads(const AhoCorasick& ac, const fs::path& root, std::size_t jobs) {
+SearchOutput search_threads(const AhoCorasick& ac, const fs::path& root, std::size_t jobs, const fs::path& output_path) {
     SearchOutput combined;
 
     const auto plan_start = std::chrono::steady_clock::now();
@@ -411,13 +471,26 @@ SearchOutput search_threads(const AhoCorasick& ac, const fs::path& root, std::si
     std::vector<SearchOutput> outputs(jobs);
     std::vector<WorkerReport> reports(jobs);
     std::atomic<std::size_t> next_file{0};
+    std::ofstream match_output;
+    std::mutex output_mutex;
+    if (!output_path.empty()) {
+        match_output.open(output_path, std::ios::binary | std::ios::app);
+        if (!match_output) {
+            throw std::runtime_error("failed to open output file " + output_path.string());
+        }
+    }
     threads.reserve(jobs);
 
     const auto spawn_start = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < jobs; ++i) {
         threads.emplace_back([&, i] {
             const auto start = std::chrono::steady_clock::now();
-            outputs[i] = search_dynamic_files(ac, files, next_file);
+            outputs[i] = search_dynamic_files(
+                ac,
+                files,
+                next_file,
+                match_output.is_open() ? &match_output : nullptr,
+                match_output.is_open() ? &output_mutex : nullptr);
             const auto end = std::chrono::steady_clock::now();
             reports[i].worker_id = i;
             reports[i].stats = outputs[i].stats;
@@ -480,7 +553,7 @@ void read_all(int fd, void* data, std::size_t size) {
 #endif
 }
 
-SearchOutput search_processes(const AhoCorasick& ac, const fs::path& root, std::size_t jobs) {
+SearchOutput search_processes(const AhoCorasick& ac, const fs::path& root, std::size_t jobs, const fs::path& output_path) {
 #if defined(__unix__) || defined(__APPLE__)
     SearchOutput combined;
 
@@ -511,7 +584,7 @@ SearchOutput search_processes(const AhoCorasick& ac, const fs::path& root, std::
             close(fds[0]);
             try {
                 const auto start = std::chrono::steady_clock::now();
-                SearchOutput output = search_assigned_files(ac, assignments[i]);
+                SearchOutput output = search_assigned_files(ac, assignments[i], output_path);
                 const auto end = std::chrono::steady_clock::now();
                 WorkerReport report;
                 report.worker_id = i;
@@ -558,6 +631,7 @@ SearchOutput search_processes(const AhoCorasick& ac, const fs::path& root, std::
     (void)ac;
     (void)root;
     (void)jobs;
+    (void)output_path;
     throw std::runtime_error("--mode processes requires a POSIX platform");
 #endif
 }
@@ -601,6 +675,7 @@ void print_phase_timings(const SearchOutput& output) {
 int main(int argc, char** argv) {
     try {
         const Options options = parse_args(argc, argv);
+        prepare_output_file(options.output_path);
 
         const auto matcher_start = std::chrono::steady_clock::now();
         MatcherLoadResult matcher = load_matcher(options.patterns_path);
@@ -609,11 +684,11 @@ int main(int argc, char** argv) {
         const auto search_start = std::chrono::steady_clock::now();
         SearchOutput output;
         if (options.mode == "single") {
-            output = search_single(matcher.matcher, options.search_path);
+            output = search_single(matcher.matcher, options.search_path, options.output_path);
         } else if (options.mode == "threads") {
-            output = search_threads(matcher.matcher, options.search_path, options.jobs);
+            output = search_threads(matcher.matcher, options.search_path, options.jobs, options.output_path);
         } else {
-            output = search_processes(matcher.matcher, options.search_path, options.jobs);
+            output = search_processes(matcher.matcher, options.search_path, options.jobs, options.output_path);
         }
         const auto search_end = std::chrono::steady_clock::now();
 

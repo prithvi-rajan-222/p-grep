@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import os
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -76,6 +78,25 @@ def run_devnull(command):
     return (time.perf_counter() - start) * 1000
 
 
+def run_rg_process(command, stdout):
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        check=False,
+        text=True,
+        stdout=stdout,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode not in (0, 1):
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            command,
+            output=None if stdout is not subprocess.PIPE else completed.stdout,
+            stderr=completed.stderr,
+        )
+    return completed
+
+
 def average(samples, key):
     values = [float(sample.get(key, 0.0)) for sample in samples]
     return sum(values) / len(values) if values else 0.0
@@ -86,7 +107,7 @@ def average_int(samples, key):
     return round(sum(values) / len(values)) if values else 0
 
 
-def pgrep_command(patterns, path, mode, jobs=None):
+def pgrep_command(patterns, path, mode, jobs=None, output=None):
     command = [
         str(P_GREP),
         "--patterns",
@@ -99,14 +120,24 @@ def pgrep_command(patterns, path, mode, jobs=None):
     ]
     if jobs is not None:
         command += ["--jobs", str(jobs)]
+    if output is not None:
+        command += ["--output", str(output)]
     return command
 
 
-def run_pgrep_case(name, command, repeats):
+def run_pgrep_case(name, command_factory, repeats):
     samples = []
     baseline_matches = None
     for _ in range(repeats):
-        completed, wall_ms = run_capture(command)
+        command = command_factory()
+        output_path = None
+        if "--output" in command:
+            output_path = Path(command[command.index("--output") + 1])
+        try:
+            completed, wall_ms = run_capture(command)
+        finally:
+            if output_path is not None:
+                output_path.unlink(missing_ok=True)
         metrics = parse_pgrep_timing(completed.stderr)
         metrics["wall_ms"] = wall_ms
         try:
@@ -129,17 +160,40 @@ def run_pgrep_case(name, command, repeats):
     }
 
 
-def run_rg(patterns, path, repeats):
+def run_rg(patterns, path, repeats, output_enabled=False):
     rg = shutil.which("rg")
     if not rg:
         return None
 
     command = [rg, "-F", "-n", "-f", str(patterns), str(path)]
-    completed, wall_ms = run_capture(command)
-    lines = completed.stdout.count("\n")
-    samples = [wall_ms]
-    for _ in range(repeats - 1):
-        samples.append(run_devnull(command))
+    if output_enabled:
+        samples = []
+        lines = None
+        for _ in range(repeats):
+            fd, output_path = tempfile.mkstemp(prefix="p-grep-rg-", suffix=".txt")
+            os.close(fd)
+            try:
+                start = time.perf_counter()
+                with open(output_path, "w", encoding="utf-8") as out:
+                    run_rg_process(command, out)
+                wall_ms = (time.perf_counter() - start) * 1000
+                samples.append(wall_ms)
+                with open(output_path, "rb") as out:
+                    line_count = out.read().count(b"\n")
+                if lines is None:
+                    lines = line_count
+            finally:
+                Path(output_path).unlink(missing_ok=True)
+    else:
+        start = time.perf_counter()
+        completed = run_rg_process(command, subprocess.PIPE)
+        wall_ms = (time.perf_counter() - start) * 1000
+        lines = completed.stdout.count("\n")
+        samples = [wall_ms]
+        for _ in range(repeats - 1):
+            start = time.perf_counter()
+            run_rg_process(command, subprocess.DEVNULL)
+            samples.append((time.perf_counter() - start) * 1000)
     return {
         "name": "rg -F -n",
         "avg_wall_ms": sum(samples) / len(samples),
@@ -187,21 +241,34 @@ def main():
     parser.add_argument("--path", type=Path, default=ROOT)
     parser.add_argument("--patterns", type=Path, default=DEFAULT_PATTERNS)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--emit-output", action="store_true", help="write matching lines to a temp file")
     args = parser.parse_args()
 
-    cases = [("p-grep single", pgrep_command(args.patterns, args.path, "single"))]
-    for jobs in JOB_COUNTS:
-        cases.append((f"p-grep threads x{jobs}", pgrep_command(args.patterns, args.path, "threads", jobs)))
-    for jobs in JOB_COUNTS:
-        cases.append((f"p-grep processes x{jobs}", pgrep_command(args.patterns, args.path, "processes", jobs)))
+    def make_case(mode, jobs=None):
+        def command_factory():
+            output = None
+            if args.emit_output:
+                fd, output_path = tempfile.mkstemp(prefix="p-grep-out-", suffix=".txt")
+                os.close(fd)
+                Path(output_path).unlink(missing_ok=True)
+                output = output_path
+            return pgrep_command(args.patterns, args.path, mode, jobs, output)
 
-    print(f"path={args.path} patterns={args.patterns} repeats={args.repeats}")
+        return command_factory
+
+    cases = [("p-grep single", make_case("single"))]
+    for jobs in JOB_COUNTS:
+        cases.append((f"p-grep threads x{jobs}", make_case("threads", jobs)))
+    for jobs in JOB_COUNTS:
+        cases.append((f"p-grep processes x{jobs}", make_case("processes", jobs)))
+
+    print(f"path={args.path} patterns={args.patterns} repeats={args.repeats} emit_output={args.emit_output}")
     print()
 
     pgrep_results = [run_pgrep_case(name, command, args.repeats) for name, command in cases]
     print_pgrep_table(pgrep_results)
 
-    rg_result = run_rg(args.patterns, args.path, args.repeats)
+    rg_result = run_rg(args.patterns, args.path, args.repeats, args.emit_output)
     if rg_result:
         baseline_lines = pgrep_results[0]["lines"]
         line_note = "" if rg_result["lines"] == baseline_lines else f" (!= {baseline_lines})"
