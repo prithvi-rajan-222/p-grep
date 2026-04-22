@@ -15,6 +15,8 @@
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
+#include <dirent.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -170,107 +172,96 @@ MatcherLoadResult load_matcher(const std::string& path) {
     };
 }
 
-bool is_hidden_name(const fs::path& path) {
-    const std::string name = path.filename().string();
+bool is_hidden_name(std::string_view name) {
     return !name.empty() && name[0] == '.';
 }
 
-bool is_basic_ignored_directory(const fs::path& path) {
-    const std::string name = path.filename().string();
+bool is_hidden_path(const fs::path& path) {
+    return is_hidden_name(path.filename().string());
+}
+
+bool is_basic_ignored_directory(std::string_view name) {
     return name == ".git"
         || name == "build"
         || name == "node_modules"
         || name == "target"
         || name == "dist"
-        || name.rfind("cmake-build-", 0) == 0;
-}
-
-bool stream_starts_binary(std::ifstream& in) {
-    constexpr std::size_t kProbeSize = 8192;
-    char buffer[kProbeSize];
-    in.read(buffer, static_cast<std::streamsize>(kProbeSize));
-    const std::streamsize n = in.gcount();
-
-    for (std::streamsize i = 0; i < n; ++i) {
-        if (buffer[i] == '\0') {
-            return true;
-        }
-    }
-
-    in.clear();
-    in.seekg(0, std::ios::beg);
-    return false;
-}
-
-bool should_search_file(const fs::directory_entry& entry) {
-    std::error_code ec;
-    if (entry.is_symlink(ec) || !entry.is_regular_file(ec)) {
-        return false;
-    }
-    if (is_hidden_name(entry.path())) {
-        return false;
-    }
-    return true;
-}
-
-bool should_descend_directory(const fs::directory_entry& entry) {
-    std::error_code ec;
-    return entry.is_directory(ec)
-        && !entry.is_symlink(ec)
-        && !is_hidden_name(entry.path())
-        && !is_basic_ignored_directory(entry.path());
-}
-
-std::uint64_t searchable_file_size(const fs::directory_entry& entry) {
-    std::error_code ec;
-    if (entry.is_symlink(ec) || !entry.is_regular_file(ec) || is_hidden_name(entry.path())) {
-        return 0;
-    }
-
-    const std::uint64_t size = entry.file_size(ec);
-    return ec ? 0 : size;
+        || name.substr(0, std::string_view("cmake-build-").size()) == "cmake-build-";
 }
 
 std::vector<FileTask> collect_file_tasks(const fs::path& root) {
+    std::vector<FileTask> files;
+
+#if defined(__unix__) || defined(__APPLE__)
+    struct stat root_stat {};
+    if (lstat(root.c_str(), &root_stat) != 0) {
+        throw std::runtime_error("failed to inspect " + root.string() + ": " + std::strerror(errno));
+    }
+
+    if (S_ISREG(root_stat.st_mode)) {
+        if (!is_hidden_path(root) && root_stat.st_size > 0) {
+            files.push_back(FileTask{root, static_cast<std::uint64_t>(root_stat.st_size)});
+        }
+        return files;
+    }
+    if (!S_ISDIR(root_stat.st_mode) || is_hidden_path(root) || is_basic_ignored_directory(root.filename().string())) {
+        return files;
+    }
+
+    std::vector<fs::path> pending;
+    pending.push_back(root);
+    while (!pending.empty()) {
+        fs::path directory = std::move(pending.back());
+        pending.pop_back();
+
+        DIR* dir = opendir(directory.c_str());
+        if (dir == nullptr) {
+            continue;
+        }
+
+        while (dirent* entry = readdir(dir)) {
+            const std::string_view name(entry->d_name);
+            if (name == "." || name == ".." || is_hidden_name(name)) {
+                continue;
+            }
+
+            fs::path child = directory / entry->d_name;
+            struct stat child_stat {};
+            if (lstat(child.c_str(), &child_stat) != 0) {
+                continue;
+            }
+            if (S_ISLNK(child_stat.st_mode)) {
+                continue;
+            }
+            if (S_ISDIR(child_stat.st_mode)) {
+                if (!is_basic_ignored_directory(name)) {
+                    pending.push_back(std::move(child));
+                }
+            } else if (S_ISREG(child_stat.st_mode) && child_stat.st_size > 0) {
+                files.push_back(FileTask{std::move(child), static_cast<std::uint64_t>(child_stat.st_size)});
+            }
+        }
+
+        closedir(dir);
+    }
+#else
     std::error_code ec;
     const fs::directory_entry root_entry(root, ec);
     if (ec) {
         throw std::runtime_error("failed to inspect " + root.string());
     }
 
-    std::vector<FileTask> files;
     if (root_entry.is_regular_file(ec)) {
-        const std::uint64_t bytes = searchable_file_size(root_entry);
-        if (bytes > 0) {
-            files.push_back(FileTask{root, bytes});
+        if (!is_hidden_path(root)) {
+            const std::uint64_t size = root_entry.file_size(ec);
+            if (!ec && size > 0) {
+                files.push_back(FileTask{root, size});
+            }
         }
         return files;
     }
-    if (!should_descend_directory(root_entry)) {
-        return files;
-    }
+#endif
 
-    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
-    const fs::recursive_directory_iterator end;
-    while (!ec && it != end) {
-        const fs::directory_entry entry = *it;
-        if (entry.is_symlink(ec)) {
-            if (entry.is_directory(ec)) {
-                it.disable_recursion_pending();
-            }
-        } else if (entry.is_directory(ec)) {
-            if (!should_descend_directory(entry)) {
-                it.disable_recursion_pending();
-            }
-        } else if (should_search_file(entry)) {
-            const std::uint64_t bytes = searchable_file_size(entry);
-            if (bytes > 0) {
-                files.push_back(FileTask{entry.path(), bytes});
-            }
-        }
-
-        it.increment(ec);
-    }
     return files;
 }
 
@@ -283,22 +274,22 @@ void search_file_task(
     if (!in) {
         return;
     }
-    if (stream_starts_binary(in)) {
-        return;
-    }
-
-    ++output.stats.files_scanned;
-    output.stats.bytes_processed += file.size;
 
     std::uint32_t state = ac.start_state();
     bool line_matched = false;
     bool saw_byte_on_line = false;
+    bool saw_content = false;
+    std::uint64_t matched_lines = 0;
 
     while (in) {
         in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         const std::streamsize n = in.gcount();
         for (std::streamsize i = 0; i < n; ++i) {
             const unsigned char ch = static_cast<unsigned char>(buffer[static_cast<std::size_t>(i)]);
+            if (ch == '\0') {
+                return;
+            }
+            saw_content = true;
             if (ch != '\n' && ch != '\r') {
                 saw_byte_on_line = true;
             }
@@ -308,7 +299,7 @@ void search_file_task(
             }
             if (ch == '\n') {
                 if (line_matched) {
-                    ++output.stats.matched_lines;
+                    ++matched_lines;
                 }
                 line_matched = false;
                 saw_byte_on_line = false;
@@ -317,9 +308,16 @@ void search_file_task(
         }
     }
 
-    if (line_matched && saw_byte_on_line) {
-        ++output.stats.matched_lines;
+    if (!saw_content) {
+        return;
     }
+
+    ++output.stats.files_scanned;
+    output.stats.bytes_processed += file.size;
+    if (line_matched && saw_byte_on_line) {
+        ++matched_lines;
+    }
+    output.stats.matched_lines += matched_lines;
 }
 
 std::uint64_t estimated_work_cost(const FileTask& file) {
