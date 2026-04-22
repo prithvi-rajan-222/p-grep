@@ -101,6 +101,18 @@ public:
         return false;
     }
 
+    [[nodiscard]] std::uint32_t start_state() const {
+        return 0;
+    }
+
+    [[nodiscard]] std::uint32_t step(std::uint32_t state, unsigned char ch) const {
+        return trie_[state].next[ch];
+    }
+
+    [[nodiscard]] bool is_match_state(std::uint32_t state) const {
+        return !trie_[state].out.empty();
+    }
+
     [[nodiscard]] std::uint64_t count_matches_in_range(
         std::string_view text,
         std::size_t valid_begin,

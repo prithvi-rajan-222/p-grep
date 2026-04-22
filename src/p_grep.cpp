@@ -274,7 +274,11 @@ std::vector<FileTask> collect_file_tasks(const fs::path& root) {
     return files;
 }
 
-void search_file_task(const AhoCorasick& ac, const FileTask& file, SearchOutput& output) {
+void search_file_task(
+    const AhoCorasick& ac,
+    const FileTask& file,
+    std::vector<char>& buffer,
+    SearchOutput& output) {
     std::ifstream in(file.path, std::ios::binary);
     if (!in) {
         return;
@@ -285,14 +289,36 @@ void search_file_task(const AhoCorasick& ac, const FileTask& file, SearchOutput&
 
     ++output.stats.files_scanned;
     output.stats.bytes_processed += file.size;
-    std::string line;
-    while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
+
+    std::uint32_t state = ac.start_state();
+    bool line_matched = false;
+    bool saw_byte_on_line = false;
+
+    while (in) {
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize n = in.gcount();
+        for (std::streamsize i = 0; i < n; ++i) {
+            const unsigned char ch = static_cast<unsigned char>(buffer[static_cast<std::size_t>(i)]);
+            if (ch != '\n' && ch != '\r') {
+                saw_byte_on_line = true;
+            }
+            state = ac.step(state, ch);
+            if (ac.is_match_state(state)) {
+                line_matched = true;
+            }
+            if (ch == '\n') {
+                if (line_matched) {
+                    ++output.stats.matched_lines;
+                }
+                line_matched = false;
+                saw_byte_on_line = false;
+                state = ac.start_state();
+            }
         }
-        if (ac.contains_match(line)) {
-            ++output.stats.matched_lines;
-        }
+    }
+
+    if (line_matched && saw_byte_on_line) {
+        ++output.stats.matched_lines;
     }
 }
 
@@ -334,8 +360,9 @@ SearchOutput search_single(const AhoCorasick& ac, const fs::path& root) {
     output.phases.work_plan_ms = elapsed_ms(plan_start, plan_end);
 
     const auto start = std::chrono::steady_clock::now();
+    std::vector<char> buffer(256 * 1024);
     for (const FileTask& file : files) {
-        search_file_task(ac, file, output);
+        search_file_task(ac, file, buffer, output);
     }
     const auto end = std::chrono::steady_clock::now();
     output.phases.worker_wait_ms = elapsed_ms(start, end);
@@ -345,8 +372,9 @@ SearchOutput search_single(const AhoCorasick& ac, const fs::path& root) {
 
 SearchOutput search_assigned_files(const AhoCorasick& ac, const std::vector<FileTask>& files) {
     SearchOutput output;
+    std::vector<char> buffer(256 * 1024);
     for (const FileTask& file : files) {
-        search_file_task(ac, file, output);
+        search_file_task(ac, file, buffer, output);
     }
     return output;
 }
@@ -356,12 +384,17 @@ SearchOutput search_dynamic_files(
     const std::vector<FileTask>& files,
     std::atomic<std::size_t>& next_file) {
     SearchOutput output;
+    std::vector<char> buffer(256 * 1024);
+    constexpr std::size_t kBatchSize = 5;
     while (true) {
-        const std::size_t index = next_file.fetch_add(1, std::memory_order_relaxed);
-        if (index >= files.size()) {
+        const std::size_t begin = next_file.fetch_add(kBatchSize, std::memory_order_relaxed);
+        if (begin >= files.size()) {
             break;
         }
-        search_file_task(ac, files[index], output);
+        const std::size_t end = std::min(begin + kBatchSize, files.size());
+        for (std::size_t index = begin; index < end; ++index) {
+            search_file_task(ac, files[index], buffer, output);
+        }
     }
     return output;
 }
