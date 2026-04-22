@@ -55,10 +55,28 @@ struct WorkUnit {
     std::uint64_t estimated_bytes = 0;
 };
 
+struct PhaseTimings {
+    std::uint64_t work_units = 0;
+    double work_plan_ms = 0.0;
+    double worker_spawn_ms = 0.0;
+    double worker_wait_ms = 0.0;
+    double merge_ms = 0.0;
+    double child_report_read_ms = 0.0;
+    double child_wait_ms = 0.0;
+    double child_output_collect_ms = 0.0;
+};
+
 struct SearchOutput {
     SearchStats stats;
     std::vector<std::string> lines;
     std::vector<WorkerReport> workers;
+    PhaseTimings phases;
+};
+
+struct MatcherLoadResult {
+    AhoCorasick matcher;
+    double pattern_read_ms = 0.0;
+    double trie_build_ms = 0.0;
 };
 
 [[noreturn]] void usage(std::string_view message = {}) {
@@ -116,7 +134,13 @@ Options parse_args(int argc, char** argv) {
     return options;
 }
 
-AhoCorasick load_matcher(const std::string& path) {
+template <typename Start, typename End>
+double elapsed_ms(Start start, End end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+MatcherLoadResult load_matcher(const std::string& path) {
+    const auto read_start = std::chrono::steady_clock::now();
     std::ifstream in(path);
     if (!in) {
         throw std::runtime_error("failed to open " + path);
@@ -130,13 +154,21 @@ AhoCorasick load_matcher(const std::string& path) {
         }
         ac.add_pattern(line);
     }
+    const auto read_end = std::chrono::steady_clock::now();
+
+    const auto build_start = std::chrono::steady_clock::now();
     ac.build();
+    const auto build_end = std::chrono::steady_clock::now();
 
     if (ac.pattern_count() == 0) {
         throw std::runtime_error("no non-empty patterns found in " + path);
     }
 
-    return ac;
+    return MatcherLoadResult{
+        std::move(ac),
+        elapsed_ms(read_start, read_end),
+        elapsed_ms(build_start, build_end),
+    };
 }
 
 bool is_hidden_name(const fs::path& path) {
@@ -424,7 +456,10 @@ std::vector<std::vector<fs::path>> assign_work_units(const std::vector<WorkUnit>
 
 SearchOutput search_single(const AhoCorasick& ac, const fs::path& root) {
     SearchOutput output;
+    const auto start = std::chrono::steady_clock::now();
     search_path(ac, root, output);
+    const auto end = std::chrono::steady_clock::now();
+    output.workers.push_back(WorkerReport{0, output.stats, elapsed_ms(start, end)});
     return output;
 }
 
@@ -437,12 +472,21 @@ SearchOutput search_assigned_roots(const AhoCorasick& ac, const std::vector<fs::
 }
 
 SearchOutput search_threads(const AhoCorasick& ac, const fs::path& root, std::size_t jobs) {
-    const auto assignments = assign_work_units(make_work_units(root), jobs);
+    SearchOutput combined;
+
+    const auto plan_start = std::chrono::steady_clock::now();
+    const auto units = make_work_units(root);
+    const auto assignments = assign_work_units(units, jobs);
+    const auto plan_end = std::chrono::steady_clock::now();
+    combined.phases.work_units = units.size();
+    combined.phases.work_plan_ms = elapsed_ms(plan_start, plan_end);
+
     std::vector<std::thread> threads;
     std::vector<SearchOutput> outputs(assignments.size());
     std::vector<WorkerReport> reports(assignments.size());
     threads.reserve(assignments.size());
 
+    const auto spawn_start = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < assignments.size(); ++i) {
         threads.emplace_back([&, i] {
             const auto start = std::chrono::steady_clock::now();
@@ -450,15 +494,20 @@ SearchOutput search_threads(const AhoCorasick& ac, const fs::path& root, std::si
             const auto end = std::chrono::steady_clock::now();
             reports[i].worker_id = i;
             reports[i].stats = outputs[i].stats;
-            reports[i].elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+            reports[i].elapsed_ms = elapsed_ms(start, end);
         });
     }
+    const auto spawn_end = std::chrono::steady_clock::now();
+    combined.phases.worker_spawn_ms = elapsed_ms(spawn_start, spawn_end);
 
+    const auto wait_start = std::chrono::steady_clock::now();
     for (auto& thread : threads) {
         thread.join();
     }
+    const auto wait_end = std::chrono::steady_clock::now();
+    combined.phases.worker_wait_ms = elapsed_ms(wait_start, wait_end);
 
-    SearchOutput combined;
+    const auto merge_start = std::chrono::steady_clock::now();
     combined.workers = std::move(reports);
     for (SearchOutput& output : outputs) {
         combined.stats += output.stats;
@@ -467,6 +516,8 @@ SearchOutput search_threads(const AhoCorasick& ac, const fs::path& root, std::si
             std::make_move_iterator(output.lines.begin()),
             std::make_move_iterator(output.lines.end()));
     }
+    const auto merge_end = std::chrono::steady_clock::now();
+    combined.phases.merge_ms = elapsed_ms(merge_start, merge_end);
     return combined;
 }
 
@@ -508,7 +559,15 @@ void read_all(int fd, void* data, std::size_t size) {
 
 SearchOutput search_processes(const AhoCorasick& ac, const fs::path& root, std::size_t jobs) {
 #if defined(__unix__) || defined(__APPLE__)
-    const auto assignments = assign_work_units(make_work_units(root), jobs);
+    SearchOutput combined;
+
+    const auto plan_start = std::chrono::steady_clock::now();
+    const auto units = make_work_units(root);
+    const auto assignments = assign_work_units(units, jobs);
+    const auto plan_end = std::chrono::steady_clock::now();
+    combined.phases.work_units = units.size();
+    combined.phases.work_plan_ms = elapsed_ms(plan_start, plan_end);
+
     std::vector<pid_t> children;
     std::vector<int> read_fds;
     std::vector<fs::path> output_paths;
@@ -519,6 +578,7 @@ SearchOutput search_processes(const AhoCorasick& ac, const fs::path& root, std::
     const fs::path tmp_dir = fs::temp_directory_path();
     const auto parent_pid = static_cast<long long>(getpid());
 
+    const auto spawn_start = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < assignments.size(); ++i) {
         int fds[2];
         if (pipe(fds) != 0) {
@@ -547,7 +607,7 @@ SearchOutput search_processes(const AhoCorasick& ac, const fs::path& root, std::
                 WorkerReport report;
                 report.worker_id = i;
                 report.stats = output.stats;
-                report.elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                report.elapsed_ms = elapsed_ms(start, end);
                 write_all(fds[1], &report, sizeof(report));
                 close(fds[1]);
                 _exit(0);
@@ -561,8 +621,10 @@ SearchOutput search_processes(const AhoCorasick& ac, const fs::path& root, std::
         read_fds.push_back(fds[0]);
         output_paths.push_back(std::move(child_output));
     }
+    const auto spawn_end = std::chrono::steady_clock::now();
+    combined.phases.worker_spawn_ms = elapsed_ms(spawn_start, spawn_end);
 
-    SearchOutput combined;
+    const auto report_start = std::chrono::steady_clock::now();
     for (int fd : read_fds) {
         WorkerReport report;
         read_all(fd, &report, sizeof(report));
@@ -570,14 +632,20 @@ SearchOutput search_processes(const AhoCorasick& ac, const fs::path& root, std::
         combined.stats += report.stats;
         combined.workers.push_back(report);
     }
+    const auto report_end = std::chrono::steady_clock::now();
+    combined.phases.child_report_read_ms = elapsed_ms(report_start, report_end);
 
+    const auto wait_start = std::chrono::steady_clock::now();
     for (pid_t child : children) {
         int status = 0;
         if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             throw std::runtime_error("child process failed");
         }
     }
+    const auto wait_end = std::chrono::steady_clock::now();
+    combined.phases.child_wait_ms = elapsed_ms(wait_start, wait_end);
 
+    const auto collect_start = std::chrono::steady_clock::now();
     for (const fs::path& output_path : output_paths) {
         std::ifstream in(output_path);
         std::string line;
@@ -587,6 +655,8 @@ SearchOutput search_processes(const AhoCorasick& ac, const fs::path& root, std::
         std::error_code ec;
         fs::remove(output_path, ec);
     }
+    const auto collect_end = std::chrono::steady_clock::now();
+    combined.phases.child_output_collect_ms = elapsed_ms(collect_start, collect_end);
 
     return combined;
 #else
@@ -615,41 +685,62 @@ void print_worker_reports(std::string_view mode, const std::vector<WorkerReport>
     }
 }
 
+void print_phase_timings(const SearchOutput& output) {
+    std::cerr << "work_units=" << output.phases.work_units
+              << " work_plan_ms=" << output.phases.work_plan_ms
+              << " worker_spawn_ms=" << output.phases.worker_spawn_ms
+              << " worker_wait_ms=" << output.phases.worker_wait_ms
+              << " merge_ms=" << output.phases.merge_ms;
+
+    if (output.phases.child_report_read_ms > 0.0
+        || output.phases.child_wait_ms > 0.0
+        || output.phases.child_output_collect_ms > 0.0) {
+        std::cerr << " child_report_read_ms=" << output.phases.child_report_read_ms
+                  << " child_wait_ms=" << output.phases.child_wait_ms
+                  << " child_output_collect_ms=" << output.phases.child_output_collect_ms;
+    }
+
+    std::cerr << "\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         const Options options = parse_args(argc, argv);
 
-        const auto build_start = std::chrono::steady_clock::now();
-        AhoCorasick ac = load_matcher(options.patterns_path);
-        const auto build_end = std::chrono::steady_clock::now();
+        const auto matcher_start = std::chrono::steady_clock::now();
+        MatcherLoadResult matcher = load_matcher(options.patterns_path);
+        const auto matcher_end = std::chrono::steady_clock::now();
 
         const auto search_start = std::chrono::steady_clock::now();
         SearchOutput output;
         if (options.mode == "single") {
-            output = search_single(ac, options.search_path);
+            output = search_single(matcher.matcher, options.search_path);
         } else if (options.mode == "threads") {
-            output = search_threads(ac, options.search_path, options.jobs);
+            output = search_threads(matcher.matcher, options.search_path, options.jobs);
         } else {
-            output = search_processes(ac, options.search_path, options.jobs);
+            output = search_processes(matcher.matcher, options.search_path, options.jobs);
         }
         const auto search_end = std::chrono::steady_clock::now();
 
         print_output(output);
 
         if (options.timing) {
-            const auto build_ms = std::chrono::duration<double, std::milli>(build_end - build_start).count();
-            const auto search_ms = std::chrono::duration<double, std::milli>(search_end - search_start).count();
-            std::cerr << "patterns=" << ac.pattern_count()
+            const auto matcher_total_ms = elapsed_ms(matcher_start, matcher_end);
+            const auto search_ms = elapsed_ms(search_start, search_end);
+            std::cerr << "patterns=" << matcher.matcher.pattern_count()
                       << " files=" << output.stats.files_scanned
                       << " bytes=" << output.stats.bytes_processed
                       << " matched_lines=" << output.stats.matched_lines
                       << " mode=" << options.mode
                       << " jobs=" << options.jobs
-                      << " build_ms=" << build_ms
+                      << " pattern_read_ms=" << matcher.pattern_read_ms
+                      << " trie_build_ms=" << matcher.trie_build_ms
+                      << " matcher_total_ms=" << matcher_total_ms
                       << " search_ms=" << search_ms
                       << "\n";
+            print_phase_timings(output);
             print_worker_reports(options.mode, output.workers);
         }
     } catch (const std::exception& e) {

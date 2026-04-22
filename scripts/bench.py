@@ -10,28 +10,47 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 P_GREP = ROOT / "bin" / "p-grep"
 DEFAULT_PATTERNS = ROOT / "patterns" / "code-search.txt"
+JOB_COUNTS = [4, 8, 16]
 
 
-def run(command, repeats, stdout):
-    samples = []
-    output = None
-    for _ in range(repeats):
-        start = time.perf_counter()
-        completed = subprocess.run(
-            command,
-            cwd=ROOT,
-            check=True,
-            text=True,
-            stdout=stdout,
-            stderr=subprocess.PIPE,
-        )
-        elapsed = time.perf_counter() - start
-        samples.append(elapsed)
-        output = completed.stdout.strip() if completed.stdout is not None else None
-    return min(samples), output
+def parse_key_values(line):
+    values = {}
+    for part in line.split():
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        values[key] = value
+    return values
 
 
-def count_output_lines(command):
+def parse_number(value):
+    try:
+        if "." in value:
+            return float(value)
+        return int(value)
+    except ValueError:
+        return value
+
+
+def parse_pgrep_timing(stderr):
+    metrics = {}
+    max_worker_ms = 0.0
+    for line in stderr.splitlines():
+        values = {key: parse_number(value) for key, value in parse_key_values(line).items()}
+        if not values:
+            continue
+        if any(key in values for key in ("patterns", "search_ms", "work_units")):
+            metrics.update(values)
+        if "elapsed_ms" in values and (
+            "threads_worker" in values or "processes_worker" in values or "single_worker" in values
+        ):
+            max_worker_ms = max(max_worker_ms, float(values["elapsed_ms"]))
+    metrics["max_worker_ms"] = max_worker_ms
+    return metrics
+
+
+def run_capture(command):
+    start = time.perf_counter()
     completed = subprocess.run(
         command,
         cwd=ROOT,
@@ -40,47 +59,154 @@ def count_output_lines(command):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    output = completed.stdout.strip()
-    return str(len(output.splitlines()) if output else 0)
+    wall_ms = (time.perf_counter() - start) * 1000
+    return completed, wall_ms
+
+
+def run_devnull(command):
+    start = time.perf_counter()
+    subprocess.run(
+        command,
+        cwd=ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    return (time.perf_counter() - start) * 1000
+
+
+def average(samples, key):
+    values = [float(sample.get(key, 0.0)) for sample in samples]
+    return sum(values) / len(values) if values else 0.0
+
+
+def average_int(samples, key):
+    values = [int(sample.get(key, 0)) for sample in samples]
+    return round(sum(values) / len(values)) if values else 0
+
+
+def pgrep_command(patterns, path, mode, jobs=None):
+    command = [
+        str(P_GREP),
+        "--patterns",
+        str(patterns),
+        "--path",
+        str(path),
+        "--mode",
+        mode,
+        "--timing",
+    ]
+    if jobs is not None:
+        command += ["--jobs", str(jobs)]
+    return command
+
+
+def run_pgrep_case(name, command, repeats):
+    samples = []
+    baseline_lines = None
+    for _ in range(repeats):
+        completed, wall_ms = run_capture(command)
+        metrics = parse_pgrep_timing(completed.stderr)
+        metrics["wall_ms"] = wall_ms
+        line_count = len(completed.stdout.splitlines())
+        metrics["output_lines"] = line_count
+        if baseline_lines is None:
+            baseline_lines = line_count
+        elif line_count != baseline_lines:
+            raise RuntimeError(f"{name} produced inconsistent line counts: {line_count} != {baseline_lines}")
+        samples.append(metrics)
+    return {
+        "name": name,
+        "samples": samples,
+        "lines": baseline_lines or 0,
+        "files": average_int(samples, "files"),
+        "bytes": average_int(samples, "bytes"),
+        "matched_lines": average_int(samples, "matched_lines"),
+    }
+
+
+def run_rg(patterns, path, repeats):
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+
+    command = [rg, "-F", "-n", "-f", str(patterns), str(path)]
+    completed, wall_ms = run_capture(command)
+    lines = len(completed.stdout.splitlines())
+    samples = [wall_ms]
+    for _ in range(repeats - 1):
+        samples.append(run_devnull(command))
+    return {
+        "name": "rg -F -n",
+        "avg_wall_ms": sum(samples) / len(samples),
+        "lines": lines,
+    }
+
+
+def print_pgrep_table(results):
+    print("p-grep averages")
+    header = (
+        f"{'command':<22} {'lines':>8} {'files':>8} {'MB':>8} "
+        f"{'wall':>9} {'read':>8} {'trie':>8} {'search':>9} {'plan':>8} "
+        f"{'spawn':>8} {'wait':>8} {'merge':>8} {'child_out':>9} {'max_worker':>11}"
+    )
+    print(header)
+    print("-" * len(header))
+    for result in results:
+        samples = result["samples"]
+        mb = result["bytes"] / (1024 * 1024)
+        wait_ms = (
+            average(samples, "worker_wait_ms")
+            + average(samples, "child_report_read_ms")
+            + average(samples, "child_wait_ms")
+        )
+        print(
+            f"{result['name']:<22} "
+            f"{result['lines']:>8} "
+            f"{result['files']:>8} "
+            f"{mb:>8.1f} "
+            f"{average(samples, 'wall_ms'):>9.2f} "
+            f"{average(samples, 'pattern_read_ms'):>8.2f} "
+            f"{average(samples, 'trie_build_ms'):>8.2f} "
+            f"{average(samples, 'search_ms'):>9.2f} "
+            f"{average(samples, 'work_plan_ms'):>8.2f} "
+            f"{average(samples, 'worker_spawn_ms'):>8.2f} "
+            f"{wait_ms:>8.2f} "
+            f"{average(samples, 'merge_ms'):>8.2f} "
+            f"{average(samples, 'child_output_collect_ms'):>9.2f} "
+            f"{average(samples, 'max_worker_ms'):>11.2f}"
+        )
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark recursive p-grep against grep and ripgrep.")
+    parser = argparse.ArgumentParser(description="Benchmark recursive p-grep against ripgrep.")
     parser.add_argument("--path", type=Path, default=ROOT)
     parser.add_argument("--patterns", type=Path, default=DEFAULT_PATTERNS)
-    parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
 
-    commands = [
-        ("p-grep single", [str(P_GREP), "--patterns", str(args.patterns), "--path", str(args.path), "--mode", "single"]),
-        (
-            f"p-grep threads x{args.jobs}",
-            [str(P_GREP), "--patterns", str(args.patterns), "--path", str(args.path), "--mode", "threads", "--jobs", str(args.jobs)],
-        ),
-        (
-            f"p-grep processes x{args.jobs}",
-            [str(P_GREP), "--patterns", str(args.patterns), "--path", str(args.path), "--mode", "processes", "--jobs", str(args.jobs)],
-        ),
-    ]
+    cases = [("p-grep single", pgrep_command(args.patterns, args.path, "single"))]
+    for jobs in JOB_COUNTS:
+        cases.append((f"p-grep threads x{jobs}", pgrep_command(args.patterns, args.path, "threads", jobs)))
+    for jobs in JOB_COUNTS:
+        cases.append((f"p-grep processes x{jobs}", pgrep_command(args.patterns, args.path, "processes", jobs)))
 
-    rg = shutil.which("rg")
-    if rg:
-        commands.append(("rg -F -n", [rg, "-F", "-n", "-f", str(args.patterns), str(args.path)]))
+    print(f"path={args.path} patterns={args.patterns} repeats={args.repeats}")
+    print()
 
-    print(f"path={args.path} patterns={args.patterns}")
-    print(f"{'command':<24} {'best_ms':>10} {'lines':>12}")
-    print("-" * 50)
+    pgrep_results = [run_pgrep_case(name, command, args.repeats) for name, command in cases]
+    print_pgrep_table(pgrep_results)
 
-    baseline = None
-    for name, command in commands:
-        lines = count_output_lines(command)
-        elapsed, _ = run(command, args.repeats, subprocess.DEVNULL)
-        if baseline is None:
-            baseline = lines
-        elif lines != baseline:
-            lines = f"{lines} (!= {baseline})"
-
-        print(f"{name:<24} {elapsed * 1000:>10.2f} {lines:>12}")
+    rg_result = run_rg(args.patterns, args.path, args.repeats)
+    if rg_result:
+        baseline_lines = pgrep_results[0]["lines"]
+        line_note = "" if rg_result["lines"] == baseline_lines else f" (!= {baseline_lines})"
+        print()
+        print("ripgrep")
+        print(f"{'command':<22} {'lines':>8} {'avg_wall_ms':>12}")
+        print("-" * 44)
+        print(f"{rg_result['name']:<22} {str(rg_result['lines']) + line_note:>8} {rg_result['avg_wall_ms']:>12.2f}")
 
 
 if __name__ == "__main__":
