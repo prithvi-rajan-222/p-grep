@@ -104,22 +104,25 @@ def pgrep_command(patterns, path, mode, jobs=None):
 
 def run_pgrep_case(name, command, repeats):
     samples = []
-    baseline_lines = None
+    baseline_matches = None
     for _ in range(repeats):
         completed, wall_ms = run_capture(command)
         metrics = parse_pgrep_timing(completed.stderr)
         metrics["wall_ms"] = wall_ms
-        line_count = len(completed.stdout.splitlines())
-        metrics["output_lines"] = line_count
-        if baseline_lines is None:
-            baseline_lines = line_count
-        elif line_count != baseline_lines:
-            raise RuntimeError(f"{name} produced inconsistent line counts: {line_count} != {baseline_lines}")
+        try:
+            match_count = int(completed.stdout.strip())
+        except ValueError as exc:
+            raise RuntimeError(f"{name} did not print a numeric count: {completed.stdout!r}") from exc
+        metrics["output_lines"] = match_count
+        if baseline_matches is None:
+            baseline_matches = match_count
+        elif match_count != baseline_matches:
+            raise RuntimeError(f"{name} produced inconsistent counts: {match_count} != {baseline_matches}")
         samples.append(metrics)
     return {
         "name": name,
         "samples": samples,
-        "lines": baseline_lines or 0,
+        "lines": baseline_matches or 0,
         "files": average_int(samples, "files"),
         "bytes": average_int(samples, "bytes"),
         "matched_lines": average_int(samples, "matched_lines"),
@@ -133,7 +136,7 @@ def run_rg(patterns, path, repeats):
 
     command = [rg, "-F", "-n", "-f", str(patterns), str(path)]
     completed, wall_ms = run_capture(command)
-    lines = len(completed.stdout.splitlines())
+    lines = completed.stdout.count("\n")
     samples = [wall_ms]
     for _ in range(repeats - 1):
         samples.append(run_devnull(command))
