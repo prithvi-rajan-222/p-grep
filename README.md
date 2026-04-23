@@ -27,13 +27,13 @@ patterns/code-search.txt       33 code-search patterns
 patterns/many-code-search.txt  250 larger code/search patterns
 ```
 
-Recent OpenClaw snapshot, count-only:
+Recent OpenClaw snapshot, count-only, `--repeats 1`:
 
-```text
-33 patterns:   p-grep threads/processes around ~210-260 ms, rg around ~220 ms
-4 patterns:    p-grep best around ~220 ms, rg noisy but similar
-250 patterns:  p-grep threads x8 around ~216 ms, rg much slower when output volume is high
-```
+| Pattern file | Patterns | Matches | Best p-grep | p-grep ms | rg ms |
+| --- | ---: | ---: | --- | ---: | ---: |
+| `patterns/few-similar.txt` | 4 | 60,211 | threads x8 | 200.87 | 227.81 |
+| `patterns/code-search.txt` | 33 | 46,503 | threads x8 | 202.53 | 223.08 |
+| `patterns/many-code-search.txt` | 250 | 1,123,976 | threads x8 | 196.58 | 706.17 |
 
 Recent OpenClaw snapshot, direct output writes:
 
