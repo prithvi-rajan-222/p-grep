@@ -1,66 +1,122 @@
 # p-grep
 
-`p-grep` is a small C++ Aho-Corasick playground for fixed-string multi-pattern code search. It starts with the classic trie plus suffix-link construction described by cp-algorithms, then searches files in a ripgrep-like `path:line:line text` format.
+Small C++ search playground for testing Aho-Corasick against `ripgrep`.
 
-It currently supports:
+This is not trying to be a full `rg` clone. It is mostly for learning how much speed we can get from a fixed-string multi-pattern matcher, threads, processes, and different output strategies.
 
-- single-threaded recursive path search
-- shared-memory multi-threaded recursive path search
-- POSIX multi-process recursive path search
-- benchmark comparison with system `grep` and `ripgrep`
+
+## Benchmarks
+
+Count-only benchmark:
+
+```sh
+python3 scripts/bench.py --path ../openclaw --patterns patterns/code-search.txt --repeats 1
+```
+
+Benchmark while writing matched output to temp files:
+
+```sh
+python3 scripts/bench.py --path ../openclaw --patterns patterns/code-search.txt --repeats 1 --emit-output
+```
+
+Pattern sets:
+
+```text
+patterns/few-similar.txt       4 similar import patterns
+patterns/code-search.txt       33 code-search patterns
+patterns/many-code-search.txt  250 larger code/search patterns
+```
+
+Recent OpenClaw snapshot, count-only:
+
+```text
+33 patterns:   p-grep threads/processes around ~210-260 ms, rg around ~220 ms
+4 patterns:    p-grep best around ~220 ms, rg noisy but similar
+250 patterns:  p-grep threads x8 around ~216 ms, rg much slower when output volume is high
+```
+
+Recent OpenClaw snapshot, direct output writes:
+
+```text
+33 patterns:   p-grep threads x8 ~266 ms, rg ~197 ms
+```
+
+Direct line-by-line output is intentionally expensive. Buffered output was faster, but we removed it to see the raw write/lock cost.
+
+## Learnings
+- Multi-threading works better than multiple processes
+- Pre calculating while thread reads which file is a bad idea - this causes us to walk the file tree unnecessarily
+- Keep a list of files, and allow threads to pick from that file when free. Slight overhead due to locks beats the need to walk the file tree
+- Moved from a struct that represented each node in the DFA, to simple vectors. This improves cache locality. Very minimal improvement ~2% faster
+- Read files chunk by chunk than line by line
+- Allow a thread to pickup multiple files (5) at once from the queue. Lesser locks acquired, leading to a speedup in time
+
+## Future path
+- Build an index of the entire codebase. Use that index to narrow down which files we need to search
+- Walk file tree while the DFA builds
+
+
+## My Setup
+
+Built/tested on macOS with:
+
+```sh
+/opt/homebrew/bin/g++-15
+C++20 / gnu++20
+Python 3
+ripgrep
+```
+
+The `Makefile` prefers `/opt/homebrew/bin/g++-15` if it exists:
+
+```make
+CXX := /opt/homebrew/bin/g++-15
+CXXFLAGS := -std=gnu++20 -O3 -DNDEBUG -Wall -Wextra -pedantic
+```
+
+Override if needed:
+
+```sh
+make CXX=g++
+```
 
 ## Build
 
 ```sh
+git clone <repo-url>
+cd p-grep
 make
 ```
 
-## Patterns
-
-The default real-code-search pattern set lives at:
+This builds:
 
 ```text
-patterns/code-search.txt
+bin/p-grep
+bin/generate-corpus
 ```
 
 ## Run
 
+Count matching lines:
+
 ```sh
-bin/p-grep --patterns patterns/code-search.txt --path /path/to/codebase --mode single --timing
-bin/p-grep --patterns patterns/code-search.txt --path /path/to/codebase --mode threads --jobs 8 --timing
-bin/p-grep --patterns patterns/code-search.txt --path /path/to/codebase --mode processes --jobs 8 --timing
+bin/p-grep --patterns patterns/code-search.txt --path ../openclaw --mode single --timing
+bin/p-grep --patterns patterns/code-search.txt --path ../openclaw --mode threads --jobs 8 --timing
+bin/p-grep --patterns patterns/code-search.txt --path ../openclaw --mode processes --jobs 8 --timing
 ```
 
-Output looks like:
+Write matched lines too:
+
+```sh
+bin/p-grep --patterns patterns/code-search.txt --path ../openclaw --mode threads --jobs 8 --output matches.txt --timing
+```
+
+Output format:
 
 ```text
-src/main.cpp:42:    // TODO: handle this case
+path:line_number:line text
 ```
 
-With `--timing`, summary and worker timing are printed to stderr. Thread/process modes include one line per requested worker:
+Current file filtering is simple: skip hidden names, symlinks, empty files, binary files with NUL bytes, and common generated directories like `.git`, `node_modules`, `build`, `dist`, `target`, and `cmake-build-*`.
 
-```text
-threads_worker=0 files=10 bytes=123456 matched_lines=42 elapsed_ms=3.21
-```
-
-## Benchmark
-
-```sh
-make bench
-```
-
-Or with custom settings:
-
-```sh
-python3 scripts/bench.py --path /path/to/codebase --patterns patterns/code-search.txt --jobs 8 --repeats 3
-```
-
-`ripgrep` is run as a fixed-string line matcher using `rg -F -n -f`. `grep` is run with `grep -R -F -n -f`.
-
-## Notes
-
-The threaded and process modes do not split individual files. They expand directory work one level below the search root, estimate each unit by bytes plus file count, then greedily assign the largest units to the currently lightest worker.
-
-The recursive search follows the basic visible ripgrep defaults: hidden files/directories are skipped, symlinks are not followed, binary files are skipped when a NUL byte is found in the first 8 KiB, and common generated directories such as `.git`, `build`, `cmake-build-*`, `node_modules`, `target`, and `dist` are skipped. Full `.gitignore`/`.ignore`/`.rgignore` parsing is not implemented yet.
-
-This project defaults to `/opt/homebrew/bin/g++-15` when it is installed, matching the compiler setup in `~/Desktop/Coding/cc`. You can override it with `make CXX=/path/to/compiler`.
+Full `.gitignore`, `.ignore`, and `.rgignore` semantics are deliberately out of scope for now.
